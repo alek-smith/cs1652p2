@@ -18,6 +18,7 @@ execs := listen_server      \
 		 select_server		\
 		 udp_test_1_server	\
 		 udp_test_1_client  \
+		 http_server1 \
 
 libs := -lpetnet -lpthread -lrt -lunwind
 

@@ -34,7 +34,12 @@ struct tcp_state {
     struct tcp_con_map * con_map;
 };
 
-
+static void __print_debug_msg(const char *);
+static struct packet *__construct_pkt(struct tcp_connection *);
+static int __send_data_pkt(struct tcp_connection *);
+static int __send_flagged_pkt(struct tcp_connection *, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t);
+static int __close_connection(struct tcp_connection *);
+static int __tcp_pkt_rx_ipv4(struct packet *);
 
 static inline struct tcp_raw_hdr *
 __get_tcp_hdr(struct packet * pkt)
@@ -149,10 +154,17 @@ tcp_listen(struct socket    * sock,
            uint16_t           local_port)
 {
     struct tcp_state      * tcp_state = petnet_state->tcp_state;
+    struct tcp_connection * con = NULL;
+	uint8_t remote_ip_octets[] = {0, 0, 0, 0};
+    struct ipv4_addr *remote_ip = ipv4_addr_from_octets(remote_ip_octets);
 
-    (void)tcp_state; // delete me
+    con = create_ipv4_tcp_con(tcp_state->con_map, local_addr, remote_ip, local_port, 0);
+    con->con_state = LISTEN;
 
-    return -1;
+    put_and_unlock_tcp_con(con);
+    __print_debug_msg("Listening...\n");
+    return 0;
+
 }
 
 int 
@@ -163,48 +175,291 @@ tcp_connect_ipv4(struct socket    * sock,
                  uint16_t           remote_port)
 {
     struct tcp_state      * tcp_state = petnet_state->tcp_state;
+    struct tcp_connection * con = NULL;
 
-    (void)tcp_state; // delete me
+    con = create_ipv4_tcp_con(tcp_state->con_map, local_addr, remote_addr, local_port, remote_port);
 
-    return -1;
+    // send SYN
+    __send_flagged_pkt(con, 0, 1, 0, 0, 0, 0);
+    con->con_state = SYN_SENT;
+
+    put_and_unlock_tcp_con(con);
+    return 0;
 }
 
+static void __print_debug_msg(const char *msg) {
+    if (petnet_state->debug_enable) {
+        pet_printf(msg);
+    }
+}
+
+// constructs a new packet for the specified tcp_connection
+// payload is NULL by default
+static struct packet *__construct_pkt(struct tcp_connection *con) {
+
+    struct packet *pkt;
+    struct tcp_raw_hdr *tcp_hdr;
+
+    if (con == NULL) {
+        return NULL;
+    }
+
+    pkt = create_empty_packet();
+    tcp_hdr = __make_tcp_hdr(pkt, 0);
+
+    tcp_hdr->src_port = htons(con->ipv4_tuple.local_port);
+    tcp_hdr->dst_port = htons(con->ipv4_tuple.remote_port);
+    tcp_hdr->header_len = pkt->layer_4_hdr_len / 4;
+    tcp_hdr->checksum = 0;
+    pkt->payload = NULL;
+    pkt->payload_len = 0;
+
+    return pkt;
+
+}
+
+static int __send_flagged_pkt(struct tcp_connection * con, uint8_t ack, uint8_t syn, uint8_t fin, uint8_t rst, uint8_t urg, uint8_t psh) {
+
+    struct packet *pkt;
+    struct tcp_raw_hdr *hdr;
+
+    pkt = __construct_pkt(con);
+    hdr = (struct tcp_raw_hdr *) pkt->layer_4_hdr;
+    hdr->flags.ACK = ack;
+    hdr->flags.FIN = fin;
+    hdr->flags.PSH = psh;
+    hdr->flags.RST = rst;
+    hdr->flags.SYN = syn;
+    hdr->flags.URG = urg;
+    if (petnet_state->debug_enable) {
+        pet_printf("About to send TCP packet...\n");
+        print_tcp_header(hdr);
+    }
+
+    if (ipv4_pkt_tx(pkt, con->ipv4_tuple.remote_ip) != 0) {
+        return -1;
+    }
+    __print_debug_msg("Flagged packet transmitted\n");
+
+    return 0;
+
+}
+
+static int __send_data_pkt(struct tcp_connection * con) {
+    
+    struct packet *pkt;
+	struct socket *sock = con->sock;
+	uint32_t len = 0;
+	void *buf = NULL;
+
+    if (con == NULL) {
+        return -1;
+    }
+
+    pkt = __construct_pkt(con);
+	
+	len = pet_socket_send_capacity(sock);
+	buf = pet_malloc(len);
+	pet_socket_sending_data(sock, buf, len);
+	pkt->payload_len = len;
+	pkt->payload = pet_malloc(len);
+	memcpy(pkt->payload, buf, len);
+	pet_free(buf);
+	
+	if (ipv4_pkt_tx(pkt, con->ipv4_tuple.remote_ip) < 0) {
+		return -1;
+	}
+    __print_debug_msg("Data packet transmitted\n");
+	
+	return 0;
+
+}
 
 int
 tcp_send(struct socket * sock)
 {
     struct tcp_state      * tcp_state = petnet_state->tcp_state;
+    struct tcp_connection * con = get_and_lock_tcp_con_from_sock(tcp_state->con_map, sock);
 
-    (void)tcp_state; // delete me
+    if (con->con_state != ESTABLISHED) {
+        log_error("TCP connection is not established\n");
+        if (con != NULL) put_and_unlock_tcp_con(con);
+        return -1;
+    }
+    
+    __send_data_pkt(con);
+    put_and_unlock_tcp_con(con);
+    return 0;
 
-    return -1;
 }
 
+static int __close_connection(struct tcp_connection *con) {
 
+    struct tcp_state *tcp_state = petnet_state->tcp_state;
+
+    remove_tcp_con(tcp_state->con_map, con);
+    return 0;
+
+}
 
 /* Petnet assumes SO_LINGER semantics, so if we'ere here there is no pending write data */
 int
 tcp_close(struct socket * sock)
 {
     struct tcp_state      * tcp_state = petnet_state->tcp_state;
-  
-    (void)tcp_state; // delete me
+    struct tcp_connection * con = get_and_lock_tcp_con_from_sock(tcp_state->con_map, sock);
 
+    if (con->con_state != ESTABLISHED) {
+        log_error("TCP connection is not established\n");
+        if (con != NULL) put_and_unlock_tcp_con(con);
+        return -1;
+    }
+
+    __send_flagged_pkt(con, 0, 0, 1, 0, 0, 0);
+    con->con_state = FIN_WAIT1;
+    __print_debug_msg("State changed to FIN_WAIT1\n");
+    put_and_unlock_tcp_con(con);
     return 0;
 }
 
+static int __tcp_pkt_rx_ipv4(struct packet *pkt) {
 
+	struct tcp_state *tcp_state = petnet_state->tcp_state;
+	struct tcp_connection *con = NULL;
+	struct socket *sock = NULL;
+	struct ipv4_raw_hdr *ipv4_hdr = (struct ipv4_raw_hdr *)pkt->layer_3_hdr;
+	struct tcp_raw_hdr *tcp_hdr = __get_tcp_hdr(pkt);
+	//void *payload = __get_payload(pkt);
+	uint32_t len = -1;
+	void *buf = NULL;
+	struct ipv4_addr *src_ip = ipv4_addr_from_octets(ipv4_hdr->src_ip);
+	struct ipv4_addr *dst_ip = ipv4_addr_from_octets(ipv4_hdr->dst_ip);
+	uint16_t src_port = htons(tcp_hdr->src_port);
+	uint16_t dst_port = htons(tcp_hdr->dst_port);
 
+	if (petnet_state->debug_enable) {
+		pet_printf("Received TCP packet\n");
+		print_tcp_header(tcp_hdr);
+	}
+	
+	con = get_and_lock_tcp_con_from_ipv4(tcp_state->con_map, dst_ip, src_ip, dst_port, src_port);
+    if (con == NULL) { // connection probably still in LISTEN state
+        uint8_t octets[] = {0, 0, 0, 0};
+        struct ipv4_addr *empty_src_ip = ipv4_addr_from_octets(octets);
+        con = get_and_lock_tcp_con_from_ipv4(tcp_state->con_map, dst_ip, empty_src_ip, dst_port, 0);
+        if (con == NULL) {
+            __print_debug_msg("TCP connection does not exist\n");
+            return -1;
+        }
+        remove_tcp_con(tcp_state->con_map, con);
+        con = create_ipv4_tcp_con(tcp_state->con_map, dst_ip, src_ip, dst_port, src_port);
+        con->con_state = LISTEN;
+        __print_debug_msg("Connection information updated\n");
+    }
+	sock = con->sock;
+	
+    if (petnet_state->debug_enable) {
+        pet_printf("state=%d\n", con->con_state);
+    }
+    if (con->con_state == ESTABLISHED) {
 
+        if (tcp_hdr->flags.RST > 0) {
+            __print_debug_msg("Received RST\n");
+            __close_connection(con);
+            pet_socket_closed(sock);
+            return 0;
 
+        } else if (tcp_hdr->flags.FIN > 0) {
+            __print_debug_msg("Received FIN\n");
+            __send_flagged_pkt(con, 1, 0, 0, 0, 0, 0);
+            con->con_state = CLOSE_WAIT;
+            __print_debug_msg("State changed to CLOSE_WAIT\n");
+            __send_flagged_pkt(con, 0, 0, 1, 0, 0, 0);
+            con->con_state = LAST_ACK;
+            __print_debug_msg("State changed to LAST_ACK\n");
+        }
+
+		len = pet_socket_recv_capacity(sock);
+        buf = pet_malloc(len);
+        pet_socket_received_data(sock, buf, len);
+        __send_flagged_pkt(con, 1, 0, 0, 0, 0, 0);
+
+	} else if (con->con_state == LISTEN) {
+
+		if (tcp_hdr->flags.SYN > 0) {
+            __print_debug_msg("Received SYN\n");
+            __send_flagged_pkt(con, 1, 1, 0, 0, 0, 0);
+            con->con_state = SYN_RCVD;
+            __print_debug_msg("State changed to SYN_RCVD\n");
+
+        } else {
+            __print_debug_msg("Received unexpected packet\n");
+        }
+
+    } else if (con->con_state == SYN_SENT) {
+
+        if (tcp_hdr->flags.SYN > 0 && tcp_hdr->flags.ACK > 0) {
+            __print_debug_msg("Received SYN-ACK\n");
+            __send_flagged_pkt(con, 1, 0, 0, 0, 0, 0);
+            con->con_state = ESTABLISHED;
+            __print_debug_msg("State changed to ESTABLISHED\n");
+            pet_socket_connected(sock);
+        }
+
+    } else if (con->con_state == SYN_RCVD) {
+
+        if (tcp_hdr->flags.ACK > 0) {
+            __print_debug_msg("Received ACK\n");
+            con->con_state = ESTABLISHED;
+            __print_debug_msg("State changed to ESTABLISHED\n");
+            pet_socket_accepted(sock, src_ip, src_port);
+
+        } else {
+            __print_debug_msg("Received unexpected packet\n");
+        }
+
+    } else if (con->con_state == FIN_WAIT1) {
+
+        if (tcp_hdr->flags.ACK > 0) {
+            __print_debug_msg("Received ACK\n");
+            con->con_state = FIN_WAIT2;
+            __print_debug_msg("State changed to FIN_WAIT2\n");
+        } else {
+            __print_debug_msg("Received unexpected packet\n");
+        }
+
+    } else if (con->con_state == FIN_WAIT2) {
+
+        if (tcp_hdr->flags.FIN > 0) {
+            __print_debug_msg("Received FIN\n");
+            __send_flagged_pkt(con, 1, 0, 0, 0, 0, 0);
+            con->con_state = TIME_WAIT;
+            __print_debug_msg("State changed to TIME_WAIT\n");
+        }
+
+    } else if (con->con_state == LAST_ACK) {
+
+        if (tcp_hdr->flags.ACK > 0) {
+            __print_debug_msg("Received ACK\n");
+            con->con_state = CLOSED;
+            __print_debug_msg("State changed to CLOSED\n");
+            __close_connection(con);
+            pet_socket_closed(sock);
+            return 0;
+        }
+
+    }
+	
+	put_and_unlock_tcp_con(con);
+	return 0;
+	
+}
 
 int 
 tcp_pkt_rx(struct packet * pkt)
 {
     if (pkt->layer_3_type == IPV4_PKT) {
-   
-        // Handle IPV4 Packet
-
+		return __tcp_pkt_rx_ipv4(pkt);
     }
 
     return -1;
